@@ -20,6 +20,7 @@ import sys
 import json
 import pandas as pd
 import matplotlib
+from dotenv import load_dotenv
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -29,6 +30,9 @@ from pathlib import Path
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
+
+# Load environment variables from .env file
+load_dotenv()
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 OUTPUT_DIR = Path("./outputs")
@@ -71,18 +75,18 @@ def get_df_info(df: pd.DataFrame) -> str:
     info_parts.append(f"\nColumns & Types:\n{df.dtypes.to_string()}")
     info_parts.append(f"\nFirst 5 rows:\n{df.head().to_string()}")
     info_parts.append(f"\nBasic Statistics:\n{df.describe(include='all').to_string()}")
-    
+
     # Null counts
     null_counts = df.isnull().sum()
     if null_counts.any():
         info_parts.append(f"\nNull Values:\n{null_counts[null_counts > 0].to_string()}")
-    
+
     return "\n".join(info_parts)
 
 
 # ─── LLM Setup ───────────────────────────────────────────────────────────────
 def get_llm():
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY environment variable is required.")
     return ChatAnthropic(model=MODEL_NAME, temperature=0, max_tokens=4096)
@@ -94,14 +98,14 @@ def router_node(state: AgentState) -> AgentState:
     try:
         df = load_dataframe(state["file_path"])
         df_info = get_df_info(df)
-        
+
         # Serialize dataframe (limit to first 500 rows for LLM context)
         df_sample = df.head(500)
         df_json = df_sample.to_json(orient="records", date_format="iso")
-        
+
         # Ask LLM if visualization is needed
         llm = get_llm()
-        routing_prompt = f"""You are a data analyst assistant. Given the user's query and the dataset info, 
+        routing_prompt = f"""You are a data analyst assistant. Given the user's query and the dataset info,
 determine if a visualization (chart/graph) would be helpful.
 
 Dataset Info:
@@ -112,13 +116,13 @@ User Query: {state['user_query']}
 Respond with ONLY a JSON object: {{"needs_visualization": true/false, "reasoning": "brief reason"}}
 """
         response = llm.invoke([HumanMessage(content=routing_prompt)])
-        
+
         try:
             result = json.loads(response.content)
             needs_viz = result.get("needs_visualization", True)
         except json.JSONDecodeError:
             needs_viz = True  # default to showing visualization
-        
+
         return {
             **state,
             "df_info": df_info,
@@ -135,9 +139,9 @@ def analyze_node(state: AgentState) -> AgentState:
     """Generate and execute pandas analysis code."""
     if state.get("error"):
         return state
-    
+
     llm = get_llm()
-    
+
     analysis_prompt = f"""You are an expert data analyst. Generate Python/pandas code to answer the user's query.
 
 Dataset Info:
@@ -158,13 +162,13 @@ Return ONLY the Python code, no markdown fences or explanations."""
 
     response = llm.invoke([HumanMessage(content=analysis_prompt)])
     code = response.content.strip()
-    
+
     # Clean up code (remove markdown fences if any)
     if code.startswith("```"):
         code = "\n".join(code.split("\n")[1:])
     if code.endswith("```"):
         code = "\n".join(code.split("\n")[:-1])
-    
+
     # Execute the code
     try:
         df = load_dataframe(state["file_path"])
@@ -173,7 +177,7 @@ Return ONLY the Python code, no markdown fences or explanations."""
         result = str(local_vars.get("result", "Analysis complete but no result variable found."))
     except Exception as e:
         result = f"Code execution error: {str(e)}"
-    
+
     return {
         **state,
         "analysis_code": code,
@@ -186,10 +190,10 @@ def visualize_node(state: AgentState) -> AgentState:
     """Generate and execute visualization code."""
     if state.get("error") or not state.get("needs_visualization", False):
         return {**state, "viz_path": ""}
-    
+
     llm = get_llm()
-    
-    viz_prompt = f"""You are an expert data visualization specialist. Generate Python code using matplotlib and/or seaborn 
+
+    viz_prompt = f"""You are an expert data visualization specialist. Generate Python code using matplotlib and/or seaborn
 to create a visualization that answers the user's query.
 
 Dataset Info:
@@ -217,19 +221,19 @@ Return ONLY the Python code, no markdown fences or explanations."""
 
     response = llm.invoke([HumanMessage(content=viz_prompt)])
     code = response.content.strip()
-    
+
     if code.startswith("```"):
         code = "\n".join(code.split("\n")[1:])
     if code.endswith("```"):
         code = "\n".join(code.split("\n")[:-1])
-    
+
     viz_path = str(OUTPUT_DIR / "chart.png")
-    
+
     try:
         df = load_dataframe(state["file_path"])
         sns.set_style("whitegrid")
         plt.rcParams.update({"figure.figsize": (12, 7), "font.size": 12})
-        
+
         local_vars = {"df": df, "plt": plt, "sns": sns, "viz_path": viz_path}
         exec(code, {
             "pd": pd,
@@ -238,17 +242,17 @@ Return ONLY the Python code, no markdown fences or explanations."""
             "sns": sns,
             "matplotlib": matplotlib,
         }, local_vars)
-        
+
         # Ensure figure is saved even if code didn't explicitly save
         if not Path(viz_path).exists():
             plt.savefig(viz_path, dpi=150, bbox_inches="tight")
             plt.close()
-            
+
     except Exception as e:
         viz_path = ""
         code += f"\n# Visualization error: {str(e)}"
         plt.close("all")
-    
+
     return {
         **state,
         "viz_code": code,
@@ -261,9 +265,9 @@ def summarize_node(state: AgentState) -> AgentState:
     """Generate a natural language summary of findings."""
     if state.get("error"):
         return {**state, "summary": f"Error occurred: {state['error']}"}
-    
+
     llm = get_llm()
-    
+
     summary_prompt = f"""You are a senior data analyst presenting findings. Write a clear, professional summary.
 
 User Query: {state['user_query']}
@@ -286,7 +290,7 @@ Write a concise but thorough summary that:
 Keep it professional and data-driven."""
 
     response = llm.invoke([HumanMessage(content=summary_prompt)])
-    
+
     return {**state, "summary": response.content}
 
 
@@ -304,13 +308,13 @@ def should_visualize(state: AgentState) -> str:
 def build_graph() -> StateGraph:
     """Construct the LangGraph state machine."""
     workflow = StateGraph(AgentState)
-    
+
     # Add nodes
     workflow.add_node("router", router_node)
     workflow.add_node("analyze", analyze_node)
     workflow.add_node("visualize", visualize_node)
     workflow.add_node("summarize", summarize_node)
-    
+
     # Define edges
     workflow.set_entry_point("router")
     workflow.add_edge("router", "analyze")
@@ -324,7 +328,7 @@ def build_graph() -> StateGraph:
     )
     workflow.add_edge("visualize", "summarize")
     workflow.add_edge("summarize", END)
-    
+
     return workflow.compile()
 
 
@@ -332,7 +336,7 @@ def build_graph() -> StateGraph:
 def run_agent(file_path: str, query: str) -> dict:
     """Run the data analyst agent on a file with a query."""
     graph = build_graph()
-    
+
     initial_state: AgentState = {
         "file_path": file_path,
         "user_query": query,
@@ -346,7 +350,7 @@ def run_agent(file_path: str, query: str) -> dict:
         "summary": "",
         "error": "",
     }
-    
+
     result = graph.invoke(initial_state)
     return result
 
@@ -354,22 +358,22 @@ def run_agent(file_path: str, query: str) -> dict:
 # ─── CLI Interface ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Data Analyst Agent (LangChain + LangGraph)")
     parser.add_argument("file", help="Path to CSV or XLSX file")
     parser.add_argument("query", help="Analysis query")
     args = parser.parse_args()
-    
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+
+    if not os.getenv("ANTHROPIC_API_KEY"):
         print("⚠️  Set ANTHROPIC_API_KEY environment variable first.")
         sys.exit(1)
-    
+
     print(f"📂 Loading: {args.file}")
     print(f"❓ Query: {args.query}")
     print("=" * 60)
-    
+
     result = run_agent(args.file, args.query)
-    
+
     if result.get("error"):
         print(f"\n❌ Error: {result['error']}")
     else:
