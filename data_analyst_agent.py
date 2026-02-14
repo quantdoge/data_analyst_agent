@@ -18,6 +18,7 @@ Nodes:
 import os
 import sys
 import json
+import time
 import pandas as pd
 import matplotlib
 from dotenv import load_dotenv
@@ -26,6 +27,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import TypedDict, Annotated, Literal, Optional
 from pathlib import Path
+from pydantic import BaseModel, Field
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -38,7 +40,7 @@ load_dotenv()
 OUTPUT_DIR = Path("./outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-MODEL_NAME = "claude-sonnet-4-20250514"
+MODEL_NAME = "claude-sonnet-4-5-20250929"
 
 # ─── State Schema ────────────────────────────────────────────────────────────
 class AgentState(TypedDict):
@@ -54,6 +56,13 @@ class AgentState(TypedDict):
     viz_path: str           # path to saved chart image
     summary: str            # final natural language summary
     error: str              # error messages if any
+
+
+# ─── Pydantic Schema for Structured Output ──────────────────────────────────
+class RouterResponse(BaseModel):
+    """Schema for router decision on visualization needs."""
+    needs_visualization: bool = Field(description="Whether a visualization would be helpful for the query")
+    reasoning: str = Field(description="Brief explanation for the decision")
 
 
 # ─── Helper: Load Data ───────────────────────────────────────────────────────
@@ -84,12 +93,29 @@ def get_df_info(df: pd.DataFrame) -> str:
     return "\n".join(info_parts)
 
 
+def create_streamlit_summary(result: dict) -> str:
+    """Create a Streamlit-compatible summary with the analysis results."""
+    summary_parts = []
+    summary_parts.append("# Data Analysis Results\n")
+
+    if result.get("summary"):
+        summary_parts.append(f"## Summary\n{result['summary']}\n")
+
+    if result.get("viz_path"):
+        summary_parts.append(f"## Visualization\nChart saved to: `{result['viz_path']}`\n")
+
+    if result.get("analysis_code"):
+        summary_parts.append(f"## Analysis Code\n```python\n{result['analysis_code']}\n```\n")
+
+    return "".join(summary_parts)
+
+
 # ─── LLM Setup ───────────────────────────────────────────────────────────────
 def get_llm():
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY environment variable is required.")
-    return ChatAnthropic(model=MODEL_NAME, temperature=0, max_tokens=4096)
+    return ChatAnthropic(model=MODEL_NAME, temperature=0, max_tokens=8000)
 
 
 # ─── Node: Router ────────────────────────────────────────────────────────────
@@ -105,6 +131,8 @@ def router_node(state: AgentState) -> AgentState:
 
         # Ask LLM if visualization is needed
         llm = get_llm()
+        structured_llm = llm.with_structured_output(RouterResponse)
+
         routing_prompt = f"""You are a data analyst assistant. Given the user's query and the dataset info,
 determine if a visualization (chart/graph) would be helpful.
 
@@ -113,14 +141,13 @@ Dataset Info:
 
 User Query: {state['user_query']}
 
-Respond with ONLY a JSON object: {{"needs_visualization": true/false, "reasoning": "brief reason"}}
-"""
-        response = llm.invoke([HumanMessage(content=routing_prompt)])
+Analyze the query and data to decide if visualization would enhance understanding."""
 
         try:
-            result = json.loads(response.content)
-            needs_viz = result.get("needs_visualization", True)
-        except json.JSONDecodeError:
+            response = structured_llm.invoke([HumanMessage(content=routing_prompt)])
+            needs_viz = response.needs_visualization
+        except Exception as e:
+            print(f"Warning: Structured output failed: {e}. Using default visualization=True")
             needs_viz = True  # default to showing visualization
 
         return {
@@ -227,12 +254,12 @@ Return ONLY the Python code, no markdown fences or explanations."""
     if code.endswith("```"):
         code = "\n".join(code.split("\n")[:-1])
 
-    viz_path = str(OUTPUT_DIR / "chart.png")
+    viz_path = str(OUTPUT_DIR / f"chart_{int(time.time())}.png")
 
     try:
         df = load_dataframe(state["file_path"])
         sns.set_style("whitegrid")
-        plt.rcParams.update({"figure.figsize": (12, 7), "font.size": 12})
+        plt.rcParams.update({"figure.figsize": (12, 8), "font.size": 11})
 
         local_vars = {"df": df, "plt": plt, "sns": sns, "viz_path": viz_path}
         exec(code, {
@@ -241,6 +268,7 @@ Return ONLY the Python code, no markdown fences or explanations."""
             "plt": plt,
             "sns": sns,
             "matplotlib": matplotlib,
+            "time": __import__("time"),
         }, local_vars)
 
         # Ensure figure is saved even if code didn't explicitly save
