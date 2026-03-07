@@ -72,6 +72,8 @@ def _init_session_state():
         "phase": "idle",
         # Incremented on every Analyse click to ensure fresh widget keys
         "profile_version": 0,
+        # Context kept after analysis to allow feedback reruns (includes temp file paths)
+        "rerun_context": None,
         # LLM-generated column profile: {var_name: {shape, columns: [...]}}
         "profile": None,
         # User-edited profile (captured from st.data_editor on every render)
@@ -194,7 +196,11 @@ def render_profile(profile: dict, version: int = 0) -> dict:
 
 # ─── Analysis runner (shared by confirm and proceed-anyway paths) ─────────────
 def _do_run_agent(pending: dict, confirmed_profile: dict) -> None:
-    """Call run_agent, store result, and update phase. Cleans up temp files."""
+    """Call run_agent, store result, and update phase.
+
+    Temp files are kept alive on success so the user can rerun with feedback.
+    They are cleaned up when a new Analyse is clicked or on failure.
+    """
     try:
         with st.spinner("🔬 Analysing your data…"):
             result = run_agent(
@@ -207,10 +213,19 @@ def _do_run_agent(pending: dict, confirmed_profile: dict) -> None:
         st.session_state.result = result
         st.session_state.phase = "done"
         st.session_state.sufficiency_result = None
+        # Keep temp files and context alive for feedback reruns
+        st.session_state.rerun_context = {
+            "temp_paths":      pending["temp_paths"],
+            "analysis_paths":  pending["analysis_paths"],
+            "analysis_labels": pending["analysis_labels"],
+            "sheet_names_map": pending["sheet_names_map"],
+            "confirmed_profile": confirmed_profile,
+            "current_query":   pending["query"],
+        }
     except Exception as e:
         st.error(f"❌ Analysis failed: {e}")
-    finally:
         cleanup_temps(pending.get("temp_paths", []))
+    finally:
         st.session_state.pending = None
 
 
@@ -320,6 +335,8 @@ def main():
         # Clean up any temp files from a previous run
         if st.session_state.pending:
             cleanup_temps(st.session_state.pending.get("temp_paths", []))
+        if st.session_state.get("rerun_context"):
+            cleanup_temps(st.session_state.rerun_context.get("temp_paths", []))
 
         # Reset all state for a fresh run
         st.session_state.phase = "idle"
@@ -329,6 +346,7 @@ def main():
         st.session_state.sufficiency_result = None
         st.session_state.result = None
         st.session_state.pending = None
+        st.session_state.rerun_context = None
 
         temp_paths: list = []
         original_names: list = []
@@ -561,6 +579,64 @@ def main():
                         st.warning(f"Could not render processed data: {e}")
                 else:
                     st.info("No processed data was returned for this query.")
+
+            # ── Feedback / revision section ───────────────────────────────────
+            st.divider()
+            st.subheader("🔄 Revise & Rerun")
+            st.caption(
+                "Describe what you'd like to change or refine. "
+                "The analysis will rerun with your feedback applied — "
+                "no need to re-upload files or re-confirm the data profile."
+            )
+
+            feedback = st.text_area(
+                "Revision request",
+                placeholder=(
+                    "e.g. 'Show top 10 instead of top 3' · "
+                    "'Filter to region = East only' · "
+                    "'Add a bar chart breakdown by category'"
+                ),
+                label_visibility="collapsed",
+                key=f"feedback_input_{st.session_state.profile_version}_{id(result)}",
+            )
+
+            col_fb, _ = st.columns([2, 5])
+            with col_fb:
+                rerun_btn = st.button(
+                    "🔄 Revise & Rerun",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not (feedback or "").strip(),
+                )
+
+            if rerun_btn and (feedback or "").strip():
+                ctx = st.session_state.get("rerun_context")
+                if ctx:
+                    # Build cumulative query so the LLM has full history
+                    revised_query = (
+                        f"{ctx['current_query']}"
+                        f"\n\n--- Revision Request ---\n{feedback.strip()}"
+                    )
+                    try:
+                        with st.spinner("🔬 Rerunning analysis with your feedback…"):
+                            revised_result = run_agent(
+                                ctx["analysis_paths"],
+                                revised_query,
+                                sheet_names=ctx["sheet_names_map"],
+                                file_labels=ctx["analysis_labels"],
+                                column_profiles=ctx["confirmed_profile"],
+                            )
+                        st.session_state.result = revised_result
+                        # Update current_query for chained feedback rounds
+                        st.session_state.rerun_context = {
+                            **ctx,
+                            "current_query": revised_query,
+                        }
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Revision failed: {e}")
+                else:
+                    st.error("Rerun context not found. Please click Analyse again.")
 
     # ── Landing / nudge messages ──────────────────────────────────────────────
     if st.session_state.phase == "idle":
