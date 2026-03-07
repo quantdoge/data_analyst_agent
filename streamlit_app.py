@@ -70,6 +70,8 @@ def _init_session_state():
     defaults = {
         # "idle" | "profiling_error" | "profiled" | "insufficient" | "done"
         "phase": "idle",
+        # Incremented on every Analyse click to ensure fresh widget keys
+        "profile_version": 0,
         # LLM-generated column profile: {var_name: {shape, columns: [...]}}
         "profile": None,
         # User-edited profile (captured from st.data_editor on every render)
@@ -88,7 +90,7 @@ def _init_session_state():
 
 
 # ─── Profile display helper ───────────────────────────────────────────────────
-def render_profile(profile: dict) -> dict:
+def render_profile(profile: dict, version: int = 0) -> dict:
     """Render the data-profiling result as editable tables.
 
     Returns the profile dict with any user edits applied.
@@ -126,7 +128,7 @@ def render_profile(profile: dict) -> dict:
 
             edited_df = st.data_editor(
                 pd.DataFrame(table_rows),
-                key=f"profile_editor_{var_name}",
+                key=f"profile_editor_{var_name}_{version}",
                 use_container_width=True,
                 hide_index=True,
                 disabled=["Column", "Sample Values"],
@@ -321,6 +323,7 @@ def main():
 
         # Reset all state for a fresh run
         st.session_state.phase = "idle"
+        st.session_state.profile_version = st.session_state.get("profile_version", 0) + 1
         st.session_state.profile = None
         st.session_state.edited_profile = None
         st.session_state.sufficiency_result = None
@@ -398,7 +401,7 @@ def main():
 
         # render_profile returns the (possibly edited) profile on every render;
         # persist it so the confirm handler can read the latest edits.
-        edited_profile = render_profile(profile)
+        edited_profile = render_profile(profile, version=st.session_state.profile_version)
         st.session_state.edited_profile = edited_profile
 
         if st.session_state.phase == "profiled":
