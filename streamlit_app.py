@@ -322,6 +322,8 @@ def main():
         # Reset all state for a fresh run
         st.session_state.phase = "idle"
         st.session_state.profile = None
+        st.session_state.edited_profile = None
+        st.session_state.sufficiency_result = None
         st.session_state.result = None
         st.session_state.pending = None
 
@@ -391,7 +393,7 @@ def main():
         st.error(f"❌ Could not profile the data: {err}")
 
     # ── Phase 2: Show profile + confirm button ────────────────────────────────
-    if st.session_state.phase in ("profiled", "done"):
+    if st.session_state.phase == "profiled":
         profile = st.session_state.profile
 
         # render_profile returns the (possibly edited) profile on every render;
