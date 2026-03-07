@@ -22,6 +22,7 @@ import webbrowser
 import threading
 import time
 from io import BytesIO
+import openpyxl  # noqa: F401 — imported to ensure xlsx export works
 from data_analyst_agent import run_agent, run_profiling, check_field_sufficiency
 
 # Allowed values for the Type dropdown in the profile editor
@@ -484,7 +485,7 @@ def main():
             st.error(f"❌ Error: {result['error']}")
         else:
             tab1, tab2, tab3, tab4 = st.tabs(
-                ["📊 Summary", "📈 Visualisation", "💻 Analysis Code", "📋 Data Info"]
+                ["📊 Summary", "📈 Visualisation", "💻 Analysis Code", "📥 Processed Data"]
             )
 
             with tab1:
@@ -517,9 +518,44 @@ def main():
                     st.code(result["viz_code"], language="python")
 
             with tab4:
-                st.subheader("Dataset Information")
-                if result.get("df_info"):
-                    st.text(result["df_info"])
+                st.subheader("Processed Data")
+                result_df_json = result.get("result_df_json", "")
+                if result_df_json:
+                    try:
+                        result_df = pd.read_json(BytesIO(result_df_json.encode()), orient="records")
+                        st.caption(
+                            f"{len(result_df):,} rows × {len(result_df.columns)} columns "
+                            "— column names are prefixed with their source dataset."
+                        )
+                        st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+                        # ── Download buttons ──────────────────────────────────
+                        dl_col1, dl_col2, _ = st.columns([1, 1, 4])
+
+                        with dl_col1:
+                            csv_bytes = result_df.to_csv(index=False).encode("utf-8")
+                            st.download_button(
+                                label="📥 Download CSV",
+                                data=csv_bytes,
+                                file_name="processed_data.csv",
+                                mime="text/csv",
+                                use_container_width=True,
+                            )
+
+                        with dl_col2:
+                            xlsx_buf = BytesIO()
+                            result_df.to_excel(xlsx_buf, index=False, engine="openpyxl")
+                            st.download_button(
+                                label="📥 Download Excel",
+                                data=xlsx_buf.getvalue(),
+                                file_name="processed_data.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                use_container_width=True,
+                            )
+                    except Exception as e:
+                        st.warning(f"Could not render processed data: {e}")
+                else:
+                    st.info("No processed data was returned for this query.")
 
     # ── Landing / nudge messages ──────────────────────────────────────────────
     if st.session_state.phase == "idle":
