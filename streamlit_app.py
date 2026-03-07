@@ -5,17 +5,24 @@ Streamlit web interface for the data analyst agent.
 Supports uploading multiple CSV or XLSX files for analysis.
 For XLSX files the user can select one, several, or all sheets — each
 selected sheet is loaded as its own independent dataset.
+
+Workflow:
+  1. Upload files + enter query → click "Analyse"
+  2. Agent profiles each dataset (LLM describes every column)
+  3. User reviews the profile and clicks "Confirm & Analyse"
+  4. Full analysis runs; results shown with interactive Plotly charts
 """
 
 import streamlit as st
 import pandas as pd
+import plotly.io as pio
 from pathlib import Path
 import tempfile
 import webbrowser
 import threading
 import time
 from io import BytesIO
-from data_analyst_agent import run_agent, OUTPUT_DIR
+from data_analyst_agent import run_agent, run_profiling
 
 # Configure Streamlit page
 st.set_page_config(
@@ -26,6 +33,7 @@ st.set_page_config(
 )
 
 
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 def auto_launch_browser():
     """Auto-launch browser after a short delay."""
     time.sleep(1)
@@ -41,10 +49,71 @@ def get_excel_sheets(file_bytes: bytes) -> tuple:
         return [], str(e)
 
 
+def cleanup_temps(temp_paths: list) -> None:
+    """Delete temporary files, ignoring any errors."""
+    for tp in temp_paths:
+        try:
+            Path(tp).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+# ─── Session-state initialisation ────────────────────────────────────────────
+def _init_session_state():
+    defaults = {
+        # "idle" | "profiling_error" | "profiled" | "done"
+        "phase": "idle",
+        # LLM-generated column profile: {var_name: {shape, columns: [...]}}
+        "profile": None,
+        # run_agent() result
+        "result": None,
+        # Args needed to call run_agent after the user confirms the profile
+        # {temp_paths, analysis_paths, analysis_labels, sheet_names_map, query}
+        "pending": None,
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+
+# ─── Profile display helper ───────────────────────────────────────────────────
+def render_profile(profile: dict) -> None:
+    """Render the data-profiling result as expandable dataset tables."""
+    st.subheader("📋 Data Profile")
+    st.caption(
+        "The agent has analysed your data. "
+        "Review the detected fields and types, then confirm to continue."
+    )
+
+    for var_name, info in profile.items():
+        rows, cols = info["shape"]
+        label = f"`{var_name}` — {rows:,} rows × {cols} columns"
+        with st.expander(label, expanded=True):
+            table_rows = []
+            for col in info["columns"]:
+                nullable = "Yes" if col.get("nullable") else "No"
+                table_rows.append({
+                    "Column": col.get("column", ""),
+                    "Type": col.get("type", ""),
+                    "Description": col.get("description", ""),
+                    "Nullable": nullable,
+                    "Sample Values": col.get("sample_values", ""),
+                })
+            st.dataframe(
+                pd.DataFrame(table_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
+    _init_session_state()
+
     st.title("📊 Data Analyst Agent")
     st.markdown(
-        "Upload one or more datasets and ask questions to get insights with visualizations!"
+        "Upload one or more datasets and ask questions to get insights "
+        "with interactive visualizations!"
     )
 
     # ── Sidebar ──────────────────────────────────────────────────────────────
@@ -138,11 +207,20 @@ def main():
             "🔍 Analyse", type="primary", use_container_width=True
         )
 
-    # ── Main content ─────────────────────────────────────────────────────────
+    # ── Phase 1: Analyse button clicked → profile the data ───────────────────
     if uploaded_files and query and analyze_button:
+        # Clean up any temp files from a previous run
+        if st.session_state.pending:
+            cleanup_temps(st.session_state.pending.get("temp_paths", []))
+
+        # Reset all state for a fresh run
+        st.session_state.phase = "idle"
+        st.session_state.profile = None
+        st.session_state.result = None
+        st.session_state.pending = None
+
         temp_paths: list = []
         original_names: list = []
-
         try:
             # Write every uploaded file to a temporary location on disk
             for uf in uploaded_files:
@@ -154,8 +232,7 @@ def main():
                     temp_paths.append(tmp.name)
                 original_names.append(uf.name)
 
-            # Build filtered file list and sheet mapping.
-            # Skip xlsx files where no sheets were selected or the file was unreadable.
+            # Build filtered file list (skip xlsx with no sheet selected)
             analysis_paths: list = []
             analysis_labels: list = []
             sheet_names_map: dict = {}
@@ -173,92 +250,155 @@ def main():
                     "No valid datasets to analyse. "
                     "Please check your file and sheet selections."
                 )
+                cleanup_temps(temp_paths)
             else:
-                with st.spinner("🔬 Analysing your data..."):
-                    result = run_agent(
+                with st.spinner("🔍 Profiling your data…"):
+                    profile = run_profiling(
                         analysis_paths,
-                        query,
                         sheet_names=sheet_names_map,
                         file_labels=analysis_labels,
                     )
 
-                if result.get("error"):
-                    st.error(f"❌ Error: {result['error']}")
+                if isinstance(profile, dict) and profile.get("error"):
+                    st.session_state.phase = "profiling_error"
+                    st.session_state.profile = profile
+                    cleanup_temps(temp_paths)
                 else:
-                    tab1, tab2, tab3, tab4 = st.tabs(
-                        ["📊 Summary", "📈 Visualisation", "💻 Analysis Code", "📋 Data Info"]
-                    )
-
-                    with tab1:
-                        st.subheader("Analysis Summary")
-                        st.markdown(result["summary"])
-
-                    with tab2:
-                        st.subheader("Visualisation")
-                        if result.get("viz_path") and Path(result["viz_path"]).exists():
-                            st.image(
-                                result["viz_path"],
-                                caption="Generated Chart",
-                                use_container_width=True,
-                            )
-                            with open(result["viz_path"], "rb") as f:
-                                st.download_button(
-                                    label="📥 Download Chart",
-                                    data=f.read(),
-                                    file_name="chart.png",
-                                    mime="image/png",
-                                )
-                        else:
-                            st.info("No visualisation was generated for this query.")
-
-                    with tab3:
-                        st.subheader("Generated Analysis Code")
-                        if result.get("analysis_code"):
-                            st.code(result["analysis_code"], language="python")
-                        if result.get("viz_code"):
-                            st.subheader("Visualisation Code")
-                            st.code(result["viz_code"], language="python")
-
-                    with tab4:
-                        st.subheader("Dataset Information")
-                        if result.get("df_info"):
-                            st.text(result["df_info"])
+                    st.session_state.profile = profile
+                    st.session_state.pending = {
+                        "temp_paths": temp_paths,
+                        "analysis_paths": analysis_paths,
+                        "analysis_labels": analysis_labels,
+                        "sheet_names_map": sheet_names_map,
+                        "query": query,
+                    }
+                    st.session_state.phase = "profiled"
 
         except Exception as e:
-            st.error(f"❌ An error occurred: {str(e)}")
+            st.error(f"❌ An error occurred during profiling: {e}")
+            cleanup_temps(temp_paths)
 
-        finally:
-            # Clean up every temporary file
-            for tp in temp_paths:
+    # ── Profiling error ───────────────────────────────────────────────────────
+    if st.session_state.phase == "profiling_error":
+        err = (st.session_state.profile or {}).get("error", "Unknown error")
+        st.error(f"❌ Could not profile the data: {err}")
+
+    # ── Phase 2: Show profile + confirm button ────────────────────────────────
+    if st.session_state.phase in ("profiled", "done"):
+        profile = st.session_state.profile
+        render_profile(profile)
+
+        if st.session_state.phase == "profiled":
+            st.divider()
+            col_confirm, col_cancel, _ = st.columns([2, 1, 4])
+
+            with col_confirm:
+                confirm = st.button(
+                    "✅ Confirm & Analyse",
+                    type="primary",
+                    use_container_width=True,
+                )
+            with col_cancel:
+                if st.button("✖ Cancel", use_container_width=True):
+                    cleanup_temps(
+                        (st.session_state.pending or {}).get("temp_paths", [])
+                    )
+                    st.session_state.phase = "idle"
+                    st.session_state.profile = None
+                    st.session_state.pending = None
+                    st.rerun()
+
+            # ── Phase 3: Run full analysis after confirmation ─────────────────
+            if confirm:
+                pending = st.session_state.pending
                 try:
-                    Path(tp).unlink()
-                except Exception:
-                    pass
+                    with st.spinner("🔬 Analysing your data…"):
+                        result = run_agent(
+                            pending["analysis_paths"],
+                            pending["query"],
+                            sheet_names=pending["sheet_names_map"],
+                            file_labels=pending["analysis_labels"],
+                        )
+                    st.session_state.result = result
+                    st.session_state.phase = "done"
+                except Exception as e:
+                    st.error(f"❌ Analysis failed: {e}")
+                finally:
+                    cleanup_temps(pending.get("temp_paths", []))
+                    st.session_state.pending = None
 
-    elif not uploaded_files:
-        st.info("👆 Please upload one or more CSV or XLSX files to get started")
+    # ── Phase 4: Display results ──────────────────────────────────────────────
+    if st.session_state.phase == "done" and st.session_state.result:
+        result = st.session_state.result
+        st.divider()
 
-        with st.expander("💡 Sample Analysis Queries"):
-            st.markdown("""
-            **Single Dataset:**
-            - "Show me sales trends over time"
-            - "Which products are performing best?"
-            - "Analyse customer segments and their purchasing patterns"
-            - "Show me data completeness and identify any outliers"
+        if result.get("error"):
+            st.error(f"❌ Error: {result['error']}")
+        else:
+            tab1, tab2, tab3, tab4 = st.tabs(
+                ["📊 Summary", "📈 Visualisation", "💻 Analysis Code", "📋 Data Info"]
+            )
 
-            **Multiple Datasets:**
-            - "Compare revenue trends across all uploaded datasets"
-            - "Find common records between datasets and analyse them"
-            - "What are the key differences between these datasets?"
-            - "Merge the datasets on the customer ID column and summarise"
+            with tab1:
+                st.subheader("Analysis Summary")
+                st.markdown(result["summary"])
 
-            **Data Quality:**
-            - "Analyse this dataset for anomalies, missing values, and data quality issues"
-            - "Show correlations between different variables"
-            """)
+            with tab2:
+                st.subheader("Visualisation")
+                viz_json = result.get("viz_json", "")
+                if viz_json:
+                    fig = pio.from_json(viz_json)
+                    st.plotly_chart(fig, use_container_width=True)
 
-    elif not query:
-        st.info("✏️ Please enter your analysis query")
+                    html_bytes = fig.to_html(include_plotlyjs="cdn").encode("utf-8")
+                    st.download_button(
+                        label="📥 Download Chart (HTML)",
+                        data=html_bytes,
+                        file_name="chart.html",
+                        mime="text/html",
+                    )
+                else:
+                    st.info("No visualisation was generated for this query.")
+
+            with tab3:
+                st.subheader("Generated Analysis Code")
+                if result.get("analysis_code"):
+                    st.code(result["analysis_code"], language="python")
+                if result.get("viz_code"):
+                    st.subheader("Visualisation Code")
+                    st.code(result["viz_code"], language="python")
+
+            with tab4:
+                st.subheader("Dataset Information")
+                if result.get("df_info"):
+                    st.text(result["df_info"])
+
+    # ── Landing / nudge messages ──────────────────────────────────────────────
+    if st.session_state.phase == "idle":
+        if not uploaded_files:
+            st.info("👆 Please upload one or more CSV or XLSX files to get started")
+
+            with st.expander("💡 Sample Analysis Queries"):
+                st.markdown("""
+                **Single Dataset:**
+                - "Show me sales trends over time"
+                - "Which products are performing best?"
+                - "Analyse customer segments and their purchasing patterns"
+                - "Show me data completeness and identify any outliers"
+
+                **Multiple Datasets:**
+                - "Compare revenue trends across all uploaded datasets"
+                - "Find common records between datasets and analyse them"
+                - "What are the key differences between these datasets?"
+                - "Merge the datasets on the customer ID column and summarise"
+
+                **Data Quality:**
+                - "Analyse this dataset for anomalies, missing values, and data quality issues"
+                - "Show correlations between different variables"
+                """)
+
+        elif not query:
+            st.info("✏️ Please enter your analysis query")
 
     # Footer
     st.markdown("---")
