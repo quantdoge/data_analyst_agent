@@ -99,28 +99,50 @@ def load_all_dataframes(
 ) -> dict:
     """Load all files and return an ordered dict of {var_name: DataFrame}.
 
-    When a single file is provided the variable is named ``df`` for
-    backward-compatibility with LLM-generated code that references ``df``.
-    With multiple files each dataset gets a descriptive name derived from its
-    label (e.g. ``df_sales``, ``df_customers``).
+    sheet_names values may be a single sheet name (str) or a list of sheet
+    names.  When multiple sheets are provided for one file, each sheet is
+    loaded as its own separate dataset.
+
+    The variable ``df`` is used when exactly one dataset is loaded in total
+    (backward-compatible).  With multiple datasets each gets a descriptive
+    name, e.g. ``df_sales``, ``df_customers_demographics``.
     """
     if sheet_names is None:
         sheet_names = {}
     if file_labels is None:
         file_labels = [Path(fp).stem for fp in file_paths]
 
+    # Expand (file_path, label) pairs into (file_path, sheet_or_None, label)
+    # entries.  A list-valued sheet entry produces one entry per sheet.
+    entries: list = []
+    for fp, label in zip(file_paths, file_labels):
+        sheets_val = sheet_names.get(fp)
+        if isinstance(sheets_val, list):
+            for sh in sheets_val:
+                entries.append((fp, sh, label))
+        else:
+            entries.append((fp, sheets_val, label))
+
+    total = len(entries)
     dfs: dict = {}
-    for i, (fp, label) in enumerate(zip(file_paths, file_labels)):
-        sheet = sheet_names.get(fp)
+    for i, (fp, sheet, label) in enumerate(entries):
         df = load_dataframe(fp, sheet_name=sheet)
 
-        if len(file_paths) == 1:
+        if total == 1:
             var_name = "df"
         else:
-            var_name = get_df_variable_name(label, i + 1)
+            base = get_df_variable_name(label, i + 1)
+            if sheet is not None:
+                safe_sheet = re.sub(r"[^a-zA-Z0-9]", "_", sheet).lower().strip("_")
+                var_name = f"{base}_{safe_sheet}"
+            else:
+                var_name = base
             # Resolve collisions
-            if var_name in dfs:
-                var_name = f"{var_name}_{i + 1}"
+            original = var_name
+            suffix = 2
+            while var_name in dfs:
+                var_name = f"{original}_{suffix}"
+                suffix += 1
 
         dfs[var_name] = df
 
