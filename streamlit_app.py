@@ -74,6 +74,8 @@ def _init_session_state():
         "profile_version": 0,
         # Context kept after analysis to allow feedback reruns (includes temp file paths)
         "rerun_context": None,
+        # True when the user has clicked Reset once and confirmation is pending
+        "confirm_reset": False,
         # LLM-generated column profile: {var_name: {shape, columns: [...]}}
         "profile": None,
         # User-edited profile (captured from st.data_editor on every render)
@@ -89,6 +91,23 @@ def _init_session_state():
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
+
+
+def _full_reset() -> None:
+    """Clean up temp files and wipe all agent state back to defaults."""
+    if st.session_state.get("pending"):
+        cleanup_temps(st.session_state.pending.get("temp_paths", []))
+    if st.session_state.get("rerun_context"):
+        cleanup_temps(st.session_state.rerun_context.get("temp_paths", []))
+    st.session_state.phase = "idle"
+    st.session_state.profile_version = st.session_state.get("profile_version", 0) + 1
+    st.session_state.confirm_reset = False
+    st.session_state.rerun_context = None
+    st.session_state.profile = None
+    st.session_state.edited_profile = None
+    st.session_state.sufficiency_result = None
+    st.session_state.result = None
+    st.session_state.pending = None
 
 
 # ─── Profile display helper ───────────────────────────────────────────────────
@@ -329,6 +348,31 @@ def main():
         analyze_button = st.button(
             "🔍 Analyse", type="primary", use_container_width=True
         )
+
+        st.divider()
+
+        reset_button = st.button(
+            "🗑 Reset", use_container_width=True
+        )
+        if reset_button:
+            st.session_state.confirm_reset = True
+
+        if st.session_state.get("confirm_reset"):
+            st.warning(
+                "**Reset everything?**\n\n"
+                "This will clear all analysis results, uploaded file context, "
+                "and agent state. You will need to re-upload files and re-enter "
+                "your query to start a new analysis."
+            )
+            col_yes, col_no = st.columns(2)
+            with col_yes:
+                if st.button("✅ Confirm", type="primary", use_container_width=True):
+                    _full_reset()
+                    st.rerun()
+            with col_no:
+                if st.button("✖ Cancel", use_container_width=True):
+                    st.session_state.confirm_reset = False
+                    st.rerun()
 
     # ── Phase 1: Analyse button clicked → profile the data ───────────────────
     if uploaded_files and query and analyze_button:
