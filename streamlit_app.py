@@ -24,6 +24,12 @@ import time
 from io import BytesIO
 from data_analyst_agent import run_agent, run_profiling
 
+# Allowed values for the Type dropdown in the profile editor
+_VALID_TYPES = [
+    "string", "integer", "float", "boolean",
+    "date", "datetime", "category", "id", "unknown",
+]
+
 # Configure Streamlit page
 st.set_page_config(
     page_title="Data Analyst Agent",
@@ -65,6 +71,8 @@ def _init_session_state():
         "phase": "idle",
         # LLM-generated column profile: {var_name: {shape, columns: [...]}}
         "profile": None,
+        # User-edited profile (captured from st.data_editor on every render)
+        "edited_profile": None,
         # run_agent() result
         "result": None,
         # Args needed to call run_agent after the user confirms the profile
@@ -77,33 +85,87 @@ def _init_session_state():
 
 
 # ─── Profile display helper ───────────────────────────────────────────────────
-def render_profile(profile: dict) -> None:
-    """Render the data-profiling result as expandable dataset tables."""
+def render_profile(profile: dict) -> dict:
+    """Render the data-profiling result as editable tables.
+
+    Returns the profile dict with any user edits applied.
+    Column and Sample Values are read-only; Type (dropdown), Description
+    (free text), and Nullable (dropdown) are fully editable.
+    """
     st.subheader("📋 Data Profile")
     st.caption(
-        "The agent has analysed your data. "
-        "Review the detected fields and types, then confirm to continue."
+        "Review and edit the detected field metadata below — "
+        "change **Type**, **Description**, or **Nullable** as needed, "
+        "then click **Confirm & Analyse** to proceed."
     )
 
+    edited_profile: dict = {}
+
     for var_name, info in profile.items():
-        rows, cols = info["shape"]
-        label = f"`{var_name}` — {rows:,} rows × {cols} columns"
+        rows, cols_count = info["shape"]
+        label = f"`{var_name}` — {rows:,} rows × {cols_count} columns"
         with st.expander(label, expanded=True):
             table_rows = []
             for col in info["columns"]:
-                nullable = "Yes" if col.get("nullable") else "No"
                 table_rows.append({
-                    "Column": col.get("column", ""),
-                    "Type": col.get("type", ""),
-                    "Description": col.get("description", ""),
-                    "Nullable": nullable,
+                    "Column":        col.get("column", ""),
+                    "Type":          col.get("type", "unknown"),
+                    "Description":   col.get("description", ""),
+                    "Nullable":      "Yes" if col.get("nullable") else "No",
                     "Sample Values": col.get("sample_values", ""),
                 })
-            st.dataframe(
+
+            edited_df = st.data_editor(
                 pd.DataFrame(table_rows),
+                key=f"profile_editor_{var_name}",
                 use_container_width=True,
                 hide_index=True,
+                disabled=["Column", "Sample Values"],
+                column_config={
+                    "Column": st.column_config.TextColumn(
+                        "Column", width="medium",
+                    ),
+                    "Type": st.column_config.SelectboxColumn(
+                        "Type",
+                        options=_VALID_TYPES,
+                        required=True,
+                        width="small",
+                        help="Select the semantic data type for this field.",
+                    ),
+                    "Description": st.column_config.TextColumn(
+                        "Description",
+                        width="large",
+                        help="Edit the field description if needed.",
+                    ),
+                    "Nullable": st.column_config.SelectboxColumn(
+                        "Nullable",
+                        options=["Yes", "No"],
+                        required=True,
+                        width="small",
+                        help="Whether this field can contain null/missing values.",
+                    ),
+                    "Sample Values": st.column_config.TextColumn(
+                        "Sample Values", width="medium",
+                    ),
+                },
             )
+
+            # Convert edited rows back into the profile column format
+            edited_profile[var_name] = {
+                "shape": info["shape"],
+                "columns": [
+                    {
+                        "column":        row["Column"],
+                        "type":          row["Type"],
+                        "description":   row["Description"],
+                        "nullable":      row["Nullable"] == "Yes",
+                        "sample_values": row["Sample Values"],
+                    }
+                    for _, row in edited_df.iterrows()
+                ],
+            }
+
+    return edited_profile
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -286,7 +348,11 @@ def main():
     # ── Phase 2: Show profile + confirm button ────────────────────────────────
     if st.session_state.phase in ("profiled", "done"):
         profile = st.session_state.profile
-        render_profile(profile)
+
+        # render_profile returns the (possibly edited) profile on every render;
+        # persist it so the confirm handler can read the latest edits.
+        edited_profile = render_profile(profile)
+        st.session_state.edited_profile = edited_profile
 
         if st.session_state.phase == "profiled":
             st.divider()
@@ -305,12 +371,14 @@ def main():
                     )
                     st.session_state.phase = "idle"
                     st.session_state.profile = None
+                    st.session_state.edited_profile = None
                     st.session_state.pending = None
                     st.rerun()
 
             # ── Phase 3: Run full analysis after confirmation ─────────────────
             if confirm:
                 pending = st.session_state.pending
+                confirmed_profile = st.session_state.edited_profile or profile
                 try:
                     with st.spinner("🔬 Analysing your data…"):
                         result = run_agent(
@@ -318,6 +386,7 @@ def main():
                             pending["query"],
                             sheet_names=pending["sheet_names_map"],
                             file_labels=pending["analysis_labels"],
+                            column_profiles=confirmed_profile,
                         )
                     st.session_state.result = result
                     st.session_state.phase = "done"

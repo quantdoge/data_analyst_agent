@@ -63,6 +63,7 @@ class AgentState(TypedDict):
     viz_json: str               # Plotly figure serialised as JSON (use pio.from_json to render)
     summary: str                # final natural language summary
     error: str                  # error messages if any
+    column_profiles: dict       # user-confirmed column profiles {var_name: {shape, columns}}
 
 
 # ─── Pydantic Schema for Structured Output ──────────────────────────────────
@@ -187,6 +188,22 @@ def _build_dataset_context(dfs: dict) -> str:
     return "\n".join(lines)
 
 
+def _build_profile_context(column_profiles: dict) -> str:
+    """Format user-confirmed column profiles as a concise LLM context block."""
+    if not column_profiles:
+        return ""
+    parts = ["User-confirmed column profiles:"]
+    for var_name, info in column_profiles.items():
+        parts.append(f"\n  Dataset `{var_name}`:")
+        for col in info.get("columns", []):
+            nullable_str = "nullable" if col.get("nullable") else "not nullable"
+            parts.append(
+                f"    • {col['column']} [{col['type']}, {nullable_str}]:"
+                f" {col['description']}"
+            )
+    return "\n".join(parts)
+
+
 def create_streamlit_summary(result: dict) -> str:
     """Create a Streamlit-compatible summary with the analysis results."""
     summary_parts = ["# Data Analysis Results\n"]
@@ -231,11 +248,12 @@ def router_node(state: AgentState) -> AgentState:
         structured_llm = llm.with_structured_output(RouterResponse)
 
         dataset_context = _build_dataset_context(dfs)
+        profile_context = _build_profile_context(state.get("column_profiles", {}))
         routing_prompt = f"""You are a data analyst assistant. Given the user's query and the dataset info,
 determine if a visualization (chart/graph) would be helpful.
 
 {dataset_context}
-
+{f"{chr(10)}{profile_context}{chr(10)}" if profile_context else ""}
 Dataset Info:
 {df_info}
 
@@ -275,13 +293,14 @@ def analyze_node(state: AgentState) -> AgentState:
         state.get("file_labels", []),
     )
     dataset_context = _build_dataset_context(dfs)
+    profile_context = _build_profile_context(state.get("column_profiles", {}))
     var_list = ", ".join(f"`{name}`" for name in dfs.keys())
     multi = len(dfs) > 1
 
     analysis_prompt = f"""You are an expert data analyst. Generate Python/pandas code to answer the user's query.
 
 {dataset_context}
-
+{f"{chr(10)}{profile_context}{chr(10)}" if profile_context else ""}
 Dataset Info:
 {state['df_info']}
 
@@ -337,6 +356,7 @@ def visualize_node(state: AgentState) -> AgentState:
         state.get("file_labels", []),
     )
     dataset_context = _build_dataset_context(dfs)
+    profile_context = _build_profile_context(state.get("column_profiles", {}))
     var_list = ", ".join(f"`{name}`" for name in dfs.keys())
     multi = len(dfs) > 1
 
@@ -344,6 +364,7 @@ def visualize_node(state: AgentState) -> AgentState:
 to create an interactive chart that answers the user's query.
 
 {dataset_context}
+{f"{chr(10)}{profile_context}{chr(10)}" if profile_context else ""}
 
 Dataset Info:
 {state['df_info']}
@@ -591,14 +612,18 @@ def run_agent(
     query: str,
     sheet_names: Optional[dict] = None,
     file_labels: Optional[List[str]] = None,
+    column_profiles: Optional[dict] = None,
 ) -> dict:
     """Run the data analyst agent on one or more files with a query.
 
     Args:
-        file_paths:   A single file path string or a list of file paths.
-        query:        Natural language analysis question.
-        sheet_names:  Optional mapping of {file_path: sheet_name | list[str]}.
-        file_labels:  Optional human-readable labels for each file.
+        file_paths:      A single file path string or a list of file paths.
+        query:           Natural language analysis question.
+        sheet_names:     Optional mapping of {file_path: sheet_name | list[str]}.
+        file_labels:     Optional human-readable labels for each file.
+        column_profiles: Optional user-confirmed column profiles from the
+                         profiling step {var_name: {shape, columns}}.
+                         Included in LLM prompts as authoritative schema context.
     """
     if isinstance(file_paths, str):
         file_paths = [file_paths]
@@ -607,6 +632,8 @@ def run_agent(
         sheet_names = {}
     if file_labels is None:
         file_labels = [Path(fp).stem for fp in file_paths]
+    if column_profiles is None:
+        column_profiles = {}
 
     graph = build_graph()
 
@@ -624,6 +651,7 @@ def run_agent(
         "viz_json": "",
         "summary": "",
         "error": "",
+        "column_profiles": column_profiles,
     }
 
     result = graph.invoke(initial_state)
