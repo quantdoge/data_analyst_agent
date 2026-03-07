@@ -73,6 +73,21 @@ class RouterResponse(BaseModel):
     reasoning: str = Field(description="Brief explanation for the decision")
 
 
+class SufficiencyResponse(BaseModel):
+    """Schema for field-sufficiency validation."""
+    sufficient: bool = Field(
+        description="True if the selected fields are enough to meaningfully answer the query"
+    )
+    reason: str = Field(description="One or two sentences explaining why")
+    suggested_fields: List[str] = Field(
+        default_factory=list,
+        description=(
+            "If not sufficient, list the specific field names (from the available "
+            "but currently excluded fields) the user should also include"
+        ),
+    )
+
+
 # ─── Helper: Variable Naming ─────────────────────────────────────────────────
 def get_df_variable_name(label: str, index: int) -> str:
     """Generate a safe Python variable name from a file label."""
@@ -189,18 +204,29 @@ def _build_dataset_context(dfs: dict) -> str:
 
 
 def _build_profile_context(column_profiles: dict) -> str:
-    """Format user-confirmed column profiles as a concise LLM context block."""
+    """Format user-confirmed column profiles as a concise LLM context block.
+
+    Only selected columns (use=True) are listed as active; excluded columns
+    are noted in aggregate so the LLM knows not to rely on them.
+    """
     if not column_profiles:
         return ""
-    parts = ["User-confirmed column profiles:"]
+    parts = ["User-confirmed column profiles (focus ONLY on selected fields):"]
     for var_name, info in column_profiles.items():
         parts.append(f"\n  Dataset `{var_name}`:")
+        selected, excluded = [], []
         for col in info.get("columns", []):
             nullable_str = "nullable" if col.get("nullable") else "not nullable"
-            parts.append(
-                f"    • {col['column']} [{col['type']}, {nullable_str}]:"
-                f" {col['description']}"
-            )
+            if col.get("use", True):
+                selected.append(
+                    f"    ✓ {col['column']} [{col['type']}, {nullable_str}]:"
+                    f" {col['description']}"
+                )
+            else:
+                excluded.append(col["column"])
+        parts.extend(selected)
+        if excluded:
+            parts.append(f"    ✗ Excluded by user: {', '.join(excluded)}")
     return "\n".join(parts)
 
 
@@ -501,16 +527,19 @@ def build_graph() -> StateGraph:
 
 
 # ─── Data Profiling ──────────────────────────────────────────────────────────
-def profile_datasets(dfs: dict) -> dict:
+def profile_datasets(dfs: dict, user_query: str = "") -> dict:
     """Use the LLM to describe every column in every loaded dataset.
+
+    When user_query is provided the LLM also marks each column as relevant
+    or not relevant for answering that specific query.
 
     Returns a dict structured as:
       {
         var_name: {
           "shape": [rows, cols],
           "columns": [
-            {"column": ..., "type": ..., "description": ..., "nullable": bool,
-             "sample_values": "..."},
+            {"column": ..., "type": ..., "description": ...,
+             "nullable": bool, "relevant": bool, "sample_values": "..."},
             ...
           ]
         },
@@ -535,8 +564,13 @@ def profile_datasets(dfs: dict) -> dict:
                 "sample_values": sample,
             })
 
-        prompt = f"""You are a data analyst reviewing a dataset schema. Describe each column concisely.
+        query_context = (
+            f"\nUser's analysis query: \"{user_query}\"\n"
+            if user_query else ""
+        )
 
+        prompt = f"""You are a data analyst reviewing a dataset schema. Describe each column concisely.
+{query_context}
 Dataset: `{var_name}` ({df.shape[0]:,} rows × {df.shape[1]} columns)
 
 Schema (JSON):
@@ -549,6 +583,8 @@ Return a JSON array — one object per column — with EXACTLY these keys:
 - "description"  : one sentence explaining what this field likely represents in a \
 business/domain context
 - "nullable"     : true if null_pct > 0, else false
+- "relevant"     : true if this column would likely be needed to answer the user's \
+query, false if it is not needed{" (set all to true if no query provided)" if not user_query else ""}
 
 Return ONLY the JSON array. No markdown fences, no extra text."""
 
@@ -570,6 +606,7 @@ Return ONLY the JSON array. No markdown fences, no extra text."""
                     "type": s["pandas_dtype"],
                     "description": "(LLM description unavailable)",
                     "nullable": s["null_pct"] > 0,
+                    "relevant": True,
                 }
                 for s in schema
             ]
@@ -579,6 +616,8 @@ Return ONLY the JSON array. No markdown fences, no extra text."""
         for item in col_profiles:
             col = item.get("column", "")
             item["sample_values"] = ", ".join(schema_by_col.get(col, {}).get("sample_values", []))
+            # Ensure relevant key exists (defensive)
+            item.setdefault("relevant", True)
 
         profiles[var_name] = {
             "shape": list(df.shape),
@@ -588,12 +627,84 @@ Return ONLY the JSON array. No markdown fences, no extra text."""
     return profiles
 
 
+def check_field_sufficiency(
+    query: str,
+    selected_columns: dict,
+    profile: dict,
+) -> dict:
+    """Check whether the user-selected fields are sufficient to answer the query.
+
+    Args:
+        query:            The user's natural language analysis query.
+        selected_columns: {var_name: [selected_col_names]} — fields the user checked.
+        profile:          Full profile dict (all columns with descriptions).
+
+    Returns:
+        {"sufficient": bool, "reason": str, "suggested_fields": [field_names]}
+    """
+    llm = get_llm()
+    structured_llm = llm.with_structured_output(SufficiencyResponse)
+
+    # Build a readable summary of selected vs available columns per dataset
+    lines: list = [f'User query: "{query}"\n']
+    for var_name, info in profile.items():
+        all_cols = {c["column"]: c for c in info.get("columns", [])}
+        sel_names = set(selected_columns.get(var_name, []))
+        excluded_names = [c for c in all_cols if c not in sel_names]
+
+        lines.append(f"Dataset `{var_name}`:")
+        lines.append("  Selected fields:")
+        for name in sel_names:
+            col = all_cols.get(name, {})
+            lines.append(
+                f"    • {name} [{col.get('type', '?')}]: {col.get('description', '')}"
+            )
+        if excluded_names:
+            lines.append("  Available but excluded fields:")
+            for name in excluded_names:
+                col = all_cols.get(name, {})
+                lines.append(
+                    f"    • {name} [{col.get('type', '?')}]: {col.get('description', '')}"
+                )
+
+    prompt = f"""You are a senior data analyst. Evaluate whether the user's selected \
+data fields are sufficient to answer their query.
+
+{chr(10).join(lines)}
+
+Guidelines:
+- Be pragmatic: if the query can be meaningfully answered with the selected fields, \
+mark it as sufficient even if extra fields might add nuance.
+- Only mark as insufficient when a critical field is clearly missing \
+(e.g. the query asks about revenue but revenue is excluded).
+- If insufficient, list ONLY the specific excluded field names that would fix the gap."""
+
+    try:
+        response = structured_llm.invoke([HumanMessage(content=prompt)])
+        return {
+            "sufficient": response.sufficient,
+            "reason": response.reason,
+            "suggested_fields": response.suggested_fields,
+        }
+    except Exception as e:
+        # Default to sufficient so errors never block the user
+        return {
+            "sufficient": True,
+            "reason": f"Sufficiency check could not run ({e}). Proceeding with selected fields.",
+            "suggested_fields": [],
+        }
+
+
 def run_profiling(
     file_paths,
     sheet_names: Optional[dict] = None,
     file_labels: Optional[List[str]] = None,
+    user_query: str = "",
 ) -> dict:
     """Load datasets and return an LLM-generated column profile for each.
+
+    user_query is forwarded to profile_datasets so the LLM can mark which
+    columns are relevant to the specific analysis request.
 
     Returns the same structure as profile_datasets(), or {"error": "..."} on failure.
     """
@@ -601,7 +712,7 @@ def run_profiling(
         file_paths = [file_paths]
     try:
         dfs = load_all_dataframes(file_paths, sheet_names, file_labels)
-        return profile_datasets(dfs)
+        return profile_datasets(dfs, user_query=user_query)
     except Exception as e:
         return {"error": str(e)}
 

@@ -22,7 +22,7 @@ import webbrowser
 import threading
 import time
 from io import BytesIO
-from data_analyst_agent import run_agent, run_profiling
+from data_analyst_agent import run_agent, run_profiling, check_field_sufficiency
 
 # Allowed values for the Type dropdown in the profile editor
 _VALID_TYPES = [
@@ -67,12 +67,14 @@ def cleanup_temps(temp_paths: list) -> None:
 # ─── Session-state initialisation ────────────────────────────────────────────
 def _init_session_state():
     defaults = {
-        # "idle" | "profiling_error" | "profiled" | "done"
+        # "idle" | "profiling_error" | "profiled" | "insufficient" | "done"
         "phase": "idle",
         # LLM-generated column profile: {var_name: {shape, columns: [...]}}
         "profile": None,
         # User-edited profile (captured from st.data_editor on every render)
         "edited_profile": None,
+        # Result of check_field_sufficiency() when fields are insufficient
+        "sufficiency_result": None,
         # run_agent() result
         "result": None,
         # Args needed to call run_agent after the user confirms the profile
@@ -103,11 +105,17 @@ def render_profile(profile: dict) -> dict:
 
     for var_name, info in profile.items():
         rows, cols_count = info["shape"]
-        label = f"`{var_name}` — {rows:,} rows × {cols_count} columns"
+        n_relevant = sum(1 for c in info["columns"] if c.get("relevant", True))
+        label = (
+            f"`{var_name}` — {rows:,} rows × {cols_count} columns"
+            f"  ({n_relevant} field(s) pre-selected as relevant)"
+        )
         with st.expander(label, expanded=True):
             table_rows = []
             for col in info["columns"]:
                 table_rows.append({
+                    # "Use" is first so it is the leftmost (most visible) column
+                    "Use":           col.get("use", col.get("relevant", True)),
                     "Column":        col.get("column", ""),
                     "Type":          col.get("type", "unknown"),
                     "Description":   col.get("description", ""),
@@ -122,6 +130,15 @@ def render_profile(profile: dict) -> dict:
                 hide_index=True,
                 disabled=["Column", "Sample Values"],
                 column_config={
+                    "Use": st.column_config.CheckboxColumn(
+                        "Use",
+                        width="small",
+                        help=(
+                            "Check to include this field in the analysis. "
+                            "Pre-selected fields were identified as relevant to your query."
+                        ),
+                        default=True,
+                    ),
                     "Column": st.column_config.TextColumn(
                         "Column", width="medium",
                     ),
@@ -150,11 +167,15 @@ def render_profile(profile: dict) -> dict:
                 },
             )
 
+            n_selected = int(edited_df["Use"].sum())
+            st.caption(f"{n_selected} of {cols_count} fields selected for analysis.")
+
             # Convert edited rows back into the profile column format
             edited_profile[var_name] = {
                 "shape": info["shape"],
                 "columns": [
                     {
+                        "use":           bool(row["Use"]),
                         "column":        row["Column"],
                         "type":          row["Type"],
                         "description":   row["Description"],
@@ -166,6 +187,28 @@ def render_profile(profile: dict) -> dict:
             }
 
     return edited_profile
+
+
+# ─── Analysis runner (shared by confirm and proceed-anyway paths) ─────────────
+def _do_run_agent(pending: dict, confirmed_profile: dict) -> None:
+    """Call run_agent, store result, and update phase. Cleans up temp files."""
+    try:
+        with st.spinner("🔬 Analysing your data…"):
+            result = run_agent(
+                pending["analysis_paths"],
+                pending["query"],
+                sheet_names=pending["sheet_names_map"],
+                file_labels=pending["analysis_labels"],
+                column_profiles=confirmed_profile,
+            )
+        st.session_state.result = result
+        st.session_state.phase = "done"
+        st.session_state.sufficiency_result = None
+    except Exception as e:
+        st.error(f"❌ Analysis failed: {e}")
+    finally:
+        cleanup_temps(pending.get("temp_paths", []))
+        st.session_state.pending = None
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -319,6 +362,7 @@ def main():
                         analysis_paths,
                         sheet_names=sheet_names_map,
                         file_labels=analysis_labels,
+                        user_query=query,
                     )
 
                 if isinstance(profile, dict) and profile.get("error"):
@@ -372,29 +416,64 @@ def main():
                     st.session_state.phase = "idle"
                     st.session_state.profile = None
                     st.session_state.edited_profile = None
+                    st.session_state.sufficiency_result = None
                     st.session_state.pending = None
                     st.rerun()
 
-            # ── Phase 3: Run full analysis after confirmation ─────────────────
+            # ── Phase 3: Sufficiency check then analysis ──────────────────
             if confirm:
                 pending = st.session_state.pending
                 confirmed_profile = st.session_state.edited_profile or profile
-                try:
-                    with st.spinner("🔬 Analysing your data…"):
-                        result = run_agent(
-                            pending["analysis_paths"],
-                            pending["query"],
-                            sheet_names=pending["sheet_names_map"],
-                            file_labels=pending["analysis_labels"],
-                            column_profiles=confirmed_profile,
-                        )
-                    st.session_state.result = result
-                    st.session_state.phase = "done"
-                except Exception as e:
-                    st.error(f"❌ Analysis failed: {e}")
-                finally:
-                    cleanup_temps(pending.get("temp_paths", []))
-                    st.session_state.pending = None
+
+                # Derive which fields the user selected per dataset
+                selected_columns = {
+                    var_name: [
+                        c["column"] for c in info["columns"] if c.get("use", True)
+                    ]
+                    for var_name, info in confirmed_profile.items()
+                }
+
+                with st.spinner("🔎 Validating field selection…"):
+                    sufficiency = check_field_sufficiency(
+                        pending["query"],
+                        selected_columns,
+                        confirmed_profile,
+                    )
+
+                if not sufficiency["sufficient"]:
+                    st.session_state.sufficiency_result = sufficiency
+                    st.session_state.phase = "insufficient"
+                    st.rerun()
+                else:
+                    _do_run_agent(pending, confirmed_profile)
+
+    # ── Phase 3b: Insufficient field selection warning ────────────────────────
+    if st.session_state.phase == "insufficient":
+        sr = st.session_state.sufficiency_result or {}
+        st.warning(f"⚠️ **Selected fields may be insufficient** — {sr.get('reason', '')}")
+
+        if sr.get("suggested_fields"):
+            fields_str = ", ".join(f"`{f}`" for f in sr["suggested_fields"])
+            st.info(
+                f"**Suggested fields to add:** {fields_str}\n\n"
+                "Click **Go Back & Revise** to return to the profile table and "
+                "check the missing fields, or **Proceed Anyway** to run the "
+                "analysis with your current selection."
+            )
+
+        col_back, col_proceed, _ = st.columns([2, 2, 3])
+        with col_back:
+            if st.button("← Go Back & Revise", use_container_width=True):
+                st.session_state.phase = "profiled"
+                st.session_state.sufficiency_result = None
+                st.rerun()
+        with col_proceed:
+            if st.button("Proceed Anyway →", type="primary", use_container_width=True):
+                pending = st.session_state.pending
+                confirmed_profile = st.session_state.edited_profile or st.session_state.profile
+                _do_run_agent(pending, confirmed_profile)
+
+        st.divider()
 
     # ── Phase 4: Display results ──────────────────────────────────────────────
     if st.session_state.phase == "done" and st.session_state.result:
