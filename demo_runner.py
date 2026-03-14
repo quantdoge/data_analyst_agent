@@ -19,7 +19,7 @@ from pathlib import Path
 
 from langgraph.graph import StateGraph, END
 
-OUTPUT_DIR = Path("/home/claude/outputs")
+OUTPUT_DIR = Path("./result")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 
@@ -103,7 +103,7 @@ def analyze_node(state: AgentState) -> AgentState:
         results = []
 
         # ── Comprehensive analysis based on query keywords ──
-        
+
         # Revenue analysis
         if any(w in query_lower for w in ["revenue", "sales", "income", "money"]):
             total = df["Revenue"].sum()
@@ -352,7 +352,7 @@ if __name__ == "__main__":
     print("  🤖 Data Analyst Agent (LangChain + LangGraph)")
     print("=" * 70)
 
-    file_path = "/home/claude/sample_sales.csv"
+    file_path = "./sample_sales.csv"
     query = "Show me revenue breakdown by region and product, with monthly trends and profit analysis"
 
     print(f"\n📂 File: {file_path}")

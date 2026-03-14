@@ -42,7 +42,7 @@ from langgraph.graph import StateGraph, END
 load_dotenv()
 
 # ─── Configuration ───────────────────────────────────────────────────────────
-OUTPUT_DIR = Path("./outputs")
+OUTPUT_DIR = Path("./result")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 MODEL_NAME = "claude-sonnet-4-6"
